@@ -1,0 +1,128 @@
+################################################################################
+#                    CEM QUARTILE-BASED BINS RATIO 1.9                         #
+################################################################################
+# Load required library
+library(dplyr)
+
+# Load data
+data <- read.csv("df_pvs.csv")
+
+# Separate groups
+g1_all <- data[data$grp == 1,]
+g2_all <- data[data$grp == 2,]
+g3_all <- data[data$grp == 3,]
+
+cat("Original sample sizes:\n")
+cat("Group 1:", nrow(g1_all), "\n")
+cat("Group 2:", nrow(g2_all), "\n")
+cat("Group 3:", nrow(g3_all), "\n\n")
+
+################################################################################
+# CEM MATCHING: QUARTILE-BASED BINS
+################################################################################
+# Define quartile-based bins
+age_quartiles <- quantile(data$age, probs = c(0, 0.25, 0.5, 0.75, 1))
+age_bins <- unique(age_quartiles)  # Remove duplicates if any
+
+cat("Age quartiles:", paste(round(age_bins, 1), collapse=", "), "\n\n")
+
+# Initialize matched samples
+g1_matched <- data.frame()
+g2_matched <- data.frame()
+g3_matched <- data.frame()
+
+# Process each bin
+for(i in 1:(length(age_bins)-1)) {
+  min_age <- age_bins[i]
+  max_age <- age_bins[i+1]
+  
+  # For the last bin, use <= instead of < to include max value
+  if(i == length(age_bins)-1) {
+    g1_bin <- g1_all[g1_all$age >= min_age & g1_all$age <= max_age,]
+    g2_bin <- g2_all[g2_all$age >= min_age & g2_all$age <= max_age,]
+    g3_bin <- g3_all[g3_all$age >= min_age & g3_all$age <= max_age,]
+  } else {
+    g1_bin <- g1_all[g1_all$age >= min_age & g1_all$age < max_age,]
+    g2_bin <- g2_all[g2_all$age >= min_age & g2_all$age < max_age,]
+    g3_bin <- g3_all[g3_all$age >= min_age & g3_all$age < max_age,]
+  }
+  
+  # If Group 3 has subjects in this bin
+  if(nrow(g3_bin) > 0) {
+    # Calculate target n (ratio 1.9:1.9:1)
+    target_n <- ceiling(1.9 * nrow(g3_bin))
+    
+    # Select from Group 1 (up to target_n)
+    n_g1 <- min(target_n, nrow(g1_bin))
+    if(n_g1 > 0) {
+      set.seed(123) # For reproducibility
+      selected_g1 <- sample(1:nrow(g1_bin), n_g1, replace = FALSE)
+      g1_matched <- rbind(g1_matched, g1_bin[selected_g1,])
+    }
+    
+    # Select from Group 2 (up to target_n)
+    n_g2 <- min(target_n, nrow(g2_bin))
+    if(n_g2 > 0) {
+      set.seed(456) # For reproducibility
+      selected_g2 <- sample(1:nrow(g2_bin), n_g2, replace = FALSE)
+      g2_matched <- rbind(g2_matched, g2_bin[selected_g2,])
+    }
+    
+    # Add all Group 3 subjects from this bin
+    g3_matched <- rbind(g3_matched, g3_bin)
+    
+    # Report bin statistics
+    cat("Quartile", i, "[", round(min_age, 1), "-", round(max_age, 1), "]:", 
+        "G1=", n_g1, "(available:", nrow(g1_bin), "),",
+        "G2=", n_g2, "(available:", nrow(g2_bin), "),",
+        "G3=", nrow(g3_bin), "\n")
+  }
+}
+
+# [Rest of the code remains the same as Option 1]
+# Combine matched groups
+matched_data <- rbind(g1_matched, g2_matched, g3_matched)
+
+################################################################################
+# RESULTS
+################################################################################
+cat("\n════════════════════════════════════════\n")
+cat("MATCHED SAMPLE SIZES:\n")
+cat("════════════════════════════════════════\n")
+cat("Group 1:", nrow(g1_matched), "\n")
+cat("Group 2:", nrow(g2_matched), "\n")
+cat("Group 3:", nrow(g3_matched), "\n")
+cat("Total N:", nrow(matched_data), "\n\n")
+
+# Calculate retention rate
+retention <- round(nrow(matched_data) / nrow(data) * 100, 1)
+cat("Retention rate:", retention, "%\n\n")
+
+# Check age balance
+cat("AGE STATISTICS:\n")
+cat("Group 1: mean =", round(mean(g1_matched$age), 1), 
+    "SD =", round(sd(g1_matched$age), 1), "\n")
+cat("Group 2: mean =", round(mean(g2_matched$age), 1), 
+    "SD =", round(sd(g2_matched$age), 1), "\n")
+cat("Group 3: mean =", round(mean(g3_matched$age), 1), 
+    "SD =", round(sd(g3_matched$age), 1), "\n\n")
+
+# ANOVA test
+aov_result <- aov(age ~ as.factor(grp), data = matched_data)
+p_value <- summary(aov_result)[[1]][1,5]
+
+cat("════════════════════════════════════════\n")
+cat("ANOVA RESULTS:\n")
+cat("════════════════════════════════════════\n")
+print(summary(aov_result))
+cat("\nAge p-value:", round(p_value, 4), "\n")
+if(p_value > 0.05) {
+  cat("✓ Groups are balanced (p > 0.05)\n")
+} else {
+  cat("⚠ Groups still differ significantly\n")
+}
+
+# Save matched dataset
+write.csv(matched_data, "cem_matched_data.csv", row.names = FALSE)
+cat("\n✓ Matched data saved as 'cem_matched_data.csv'\n")
+cat("════════════════════════════════════════\n")
