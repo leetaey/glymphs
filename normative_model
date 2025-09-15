@@ -1,0 +1,331 @@
+# 그룹별 Trajectory 및 발달 궤적 분석
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import BayesianRidge, LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. 데이터 로드
+df = pd.read_csv('df3.csv')
+df['group_label'] = df['grp'].map({1: 'Control', 2: 'FEP', 3: 'TRS'})
+
+# 2. 각 그룹별 trajectory 모델링
+def fit_group_trajectory(group_data, degree=2):
+    """각 그룹에 대한 polynomial regression"""
+    X = group_data['age'].values.reshape(-1, 1)
+    y = group_data['bg_pvs_vol'].values
+    
+    # Polynomial features
+    poly = PolynomialFeatures(degree=degree)
+    X_poly = poly.fit_transform(X)
+    
+    # Fit model
+    model = LinearRegression()
+    model.fit(X_poly, y)
+    
+    return model, poly
+
+# 3. 그룹별 모델 학습
+models = {}
+polys = {}
+colors = {1: 'blue', 2: 'green', 3: 'red'}
+labels = {1: 'Control', 2: 'FEP', 3: 'TRS'}
+
+for grp in [1, 2, 3]:
+    group_data = df[df['grp'] == grp]
+    models[grp], polys[grp] = fit_group_trajectory(group_data, degree=2)
+    print(f"{labels[grp]} 그룹: n={len(group_data)}")
+
+# 4. Trajectory 예측
+age_range = np.linspace(df['age'].min(), df['age'].max(), 100)
+trajectories = {}
+
+for grp in [1, 2, 3]:
+    X_range = age_range.reshape(-1, 1)
+    X_poly = polys[grp].transform(X_range)
+    trajectories[grp] = models[grp].predict(X_poly)
+
+# 5. Normative model (정상인 기준)
+controls = df[df['grp'] == 1]
+covariates = ['age', 'sex', 'hand', 'bg_vol']
+target = 'bg_pvs_vol'
+
+from sklearn.preprocessing import StandardScaler
+
+X_train = controls[covariates].values
+y_train = controls[target].values
+X_all = df[covariates].values
+y_all = df[target].values
+
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+X_train_scaled = scaler_X.fit_transform(X_train)
+y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+X_all_scaled = scaler_X.transform(X_all)
+
+model_norm = BayesianRidge(max_iter=300)
+model_norm.fit(X_train_scaled, y_train_scaled)
+
+y_pred_scaled, y_std = model_norm.predict(X_all_scaled, return_std=True)
+y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+y_std_original = y_std * scaler_y.scale_[0]
+
+df['z_score'] = (y_all - y_pred) / y_std_original
+
+# 6. 시각화
+fig = plt.figure(figsize=(16, 12))
+
+# Plot 1: 그룹별 Trajectories
+ax1 = plt.subplot(2, 3, 1)
+for grp in [1, 2, 3]:
+    # Trajectory line
+    ax1.plot(age_range, trajectories[grp], color=colors[grp], 
+             linewidth=2.5, label=labels[grp], alpha=0.8)
+    
+    # 실제 데이터 점
+    group_data = df[df['grp'] == grp]
+    ax1.scatter(group_data['age'], group_data[target], 
+               color=colors[grp], alpha=0.3, s=30)
+
+ax1.set_xlabel('Age (years)', fontsize=11)
+ax1.set_ylabel('BG PVS Volume', fontsize=11)
+ax1.set_title('A. Group Trajectories', fontsize=12, fontweight='bold')
+ax1.legend(loc='best')
+ax1.grid(True, alpha=0.3)
+
+# Plot 2: Trajectory 차이 (Control 대비)
+ax2 = plt.subplot(2, 3, 2)
+ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
+ax2.fill_between(age_range, -5, 5, where=(age_range < 30), 
+                 alpha=0.1, color='blue', label='Young Age')
+ax2.fill_between(age_range, -5, 5, where=(age_range >= 30) & (age_range < 40), 
+                 alpha=0.1, color='yellow', label='Middle Age')
+ax2.fill_between(age_range, -5, 5, where=(age_range >= 40), 
+                 alpha=0.1, color='red', label='Older Age')
+
+# FEP와 TRS의 Control 대비 차이
+diff_fep = trajectories[2] - trajectories[1]
+diff_trs = trajectories[3] - trajectories[1]
+
+ax2.plot(age_range, diff_fep, color='green', linewidth=2, label='FEP - Control')
+ax2.plot(age_range, diff_trs, color='red', linewidth=2, label='TRS - Control')
+
+ax2.set_xlabel('Age (years)', fontsize=11)
+ax2.set_ylabel('Difference from Control', fontsize=11)
+ax2.set_title('B. Deviation from Control Trajectory', fontsize=12, fontweight='bold')
+ax2.legend(loc='best')
+ax2.grid(True, alpha=0.3)
+
+# Plot 3: Divergence Analysis (언제부터 차이가 나는가?)
+ax3 = plt.subplot(2, 3, 3)
+
+# 나이 구간별 effect size 계산
+age_bins = [(20, 30), (30, 40), (40, 50)]
+effect_sizes_fep = []
+effect_sizes_trs = []
+age_centers = []
+
+for age_min, age_max in age_bins:
+    age_mask = (df['age'] >= age_min) & (df['age'] < age_max)
+    
+    control_vals = df[(df['grp'] == 1) & age_mask][target].values
+    fep_vals = df[(df['grp'] == 2) & age_mask][target].values
+    trs_vals = df[(df['grp'] == 3) & age_mask][target].values
+    
+    # Cohen's d 계산
+    def cohens_d(x, y):
+        if len(x) == 0 or len(y) == 0:
+            return np.nan
+        pooled_std = np.sqrt((np.var(x, ddof=1) + np.var(y, ddof=1)) / 2)
+        if pooled_std == 0:
+            return 0
+        return (np.mean(y) - np.mean(x)) / pooled_std
+    
+    effect_sizes_fep.append(cohens_d(control_vals, fep_vals))
+    effect_sizes_trs.append(cohens_d(control_vals, trs_vals))
+    age_centers.append((age_min + age_max) / 2)
+
+# Bar plot
+x_pos = np.arange(len(age_centers))
+width = 0.35
+
+bars1 = ax3.bar(x_pos - width/2, effect_sizes_fep, width, 
+                label='FEP vs Control', color='green', alpha=0.7)
+bars2 = ax3.bar(x_pos + width/2, effect_sizes_trs, width, 
+                label='TRS vs Control', color='red', alpha=0.7)
+
+ax3.set_xlabel('Age Group', fontsize=11)
+ax3.set_ylabel("Cohen's d", fontsize=11)
+ax3.set_title('C. Age-specific Effect Sizes', fontsize=12, fontweight='bold')
+ax3.set_xticks(x_pos)
+ax3.set_xticklabels([f'{int(a)}s' for a in age_centers])
+ax3.axhline(y=0, color='black', linestyle='-', linewidth=1)
+ax3.axhline(y=0.8, color='gray', linestyle='--', alpha=0.5, label='Large effect')
+ax3.legend(loc='best')
+ax3.grid(True, alpha=0.3)
+
+# Plot 4: Slope Analysis (기울기 비교)
+ax4 = plt.subplot(2, 3, 4)
+
+# 각 그룹의 연령대별 기울기 계산
+def calculate_local_slope(group_data, age_point, window=5):
+    """특정 나이 지점에서의 local slope 계산"""
+    mask = (group_data['age'] >= age_point - window) & \
+           (group_data['age'] <= age_point + window)
+    local_data = group_data[mask]
+    
+    if len(local_data) < 3:
+        return np.nan
+    
+    slope, _ = np.polyfit(local_data['age'], local_data[target], 1)
+    return slope
+
+age_points = np.arange(25, 50, 5)
+slopes = {grp: [] for grp in [1, 2, 3]}
+
+for age_pt in age_points:
+    for grp in [1, 2, 3]:
+        group_data = df[df['grp'] == grp]
+        slope = calculate_local_slope(group_data, age_pt)
+        slopes[grp].append(slope)
+
+for grp in [1, 2, 3]:
+    ax4.plot(age_points, slopes[grp], marker='o', 
+            color=colors[grp], label=labels[grp], linewidth=2)
+
+ax4.set_xlabel('Age (years)', fontsize=11)
+ax4.set_ylabel('Local Slope', fontsize=11)
+ax4.set_title('D. Developmental Rate (Slope) by Age', fontsize=12, fontweight='bold')
+ax4.axhline(y=0, color='black', linestyle='-', linewidth=1)
+ax4.legend(loc='best')
+ax4.grid(True, alpha=0.3)
+
+# Plot 5: Individual Z-scores by Age Group
+ax5 = plt.subplot(2, 3, 5)
+
+# Violin plot by age group
+df['age_group'] = pd.cut(df['age'], bins=[0, 30, 40, 100], 
+                         labels=['<30', '30-40', '40+'])
+
+data_for_plot = []
+positions = []
+colors_plot = []
+pos = 0
+
+for age_grp in ['<30', '30-40', '40+']:
+    for grp in [1, 2, 3]:
+        data_subset = df[(df['age_group'] == age_grp) & (df['grp'] == grp)]['z_score']
+        if len(data_subset) > 0:
+            data_for_plot.append(data_subset.values)
+            positions.append(pos)
+            colors_plot.append(colors[grp])
+            pos += 1
+    pos += 0.5  # 그룹 간 간격
+
+parts = ax5.violinplot(data_for_plot, positions=positions, widths=0.8, 
+                       showmeans=True, showmedians=True)
+
+# 색상 적용
+for pc, color in zip(parts['bodies'], colors_plot):
+    pc.set_facecolor(color)
+    pc.set_alpha(0.6)
+
+ax5.set_xlabel('Age Group & Diagnosis', fontsize=11)
+ax5.set_ylabel('Z-score', fontsize=11)
+ax5.set_title('E. Z-score Distribution by Age & Group', fontsize=12, fontweight='bold')
+ax5.axhline(y=0, color='black', linestyle='-', linewidth=1)
+ax5.axhline(y=2, color='red', linestyle='--', alpha=0.5)
+ax5.axhline(y=-2, color='red', linestyle='--', alpha=0.5)
+ax5.set_xticks([1, 4.5, 8])
+ax5.set_xticklabels(['<30', '30-40', '40+'])
+ax5.grid(True, alpha=0.3)
+
+# Plot 6: Cumulative Divergence
+ax6 = plt.subplot(2, 3, 6)
+
+# 누적 차이 계산
+cumulative_diff_fep = np.cumsum(np.abs(diff_fep))
+cumulative_diff_trs = np.cumsum(np.abs(diff_trs))
+
+ax6.plot(age_range, cumulative_diff_fep, color='green', 
+         linewidth=2, label='FEP Cumulative Deviation')
+ax6.plot(age_range, cumulative_diff_trs, color='red', 
+         linewidth=2, label='TRS Cumulative Deviation')
+
+ax6.set_xlabel('Age (years)', fontsize=11)
+ax6.set_ylabel('Cumulative Deviation', fontsize=11)
+ax6.set_title('F. Cumulative Divergence from Normal', fontsize=12, fontweight='bold')
+ax6.legend(loc='best')
+ax6.grid(True, alpha=0.3)
+
+# 발병 시점 추정 (divergence point)
+threshold = 10  # 임계값
+fep_diverge = age_range[np.where(cumulative_diff_fep > threshold)[0][0]] if np.any(cumulative_diff_fep > threshold) else None
+trs_diverge = age_range[np.where(cumulative_diff_trs > threshold)[0][0]] if np.any(cumulative_diff_trs > threshold) else None
+
+if fep_diverge:
+    ax6.axvline(x=fep_diverge, color='green', linestyle=':', alpha=0.7)
+    ax6.text(fep_diverge, ax6.get_ylim()[1]*0.9, f'FEP: {fep_diverge:.1f}y', 
+            rotation=90, va='top', fontsize=9)
+if trs_diverge:
+    ax6.axvline(x=trs_diverge, color='red', linestyle=':', alpha=0.7)
+    ax6.text(trs_diverge, ax6.get_ylim()[1]*0.9, f'TRS: {trs_diverge:.1f}y', 
+            rotation=90, va='top', fontsize=9)
+
+plt.tight_layout()
+plt.savefig('group_trajectories_analysis.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 7. 통계 분석 출력
+print("="*60)
+print("발달 궤적 분석 결과")
+print("="*60)
+
+# 각 그룹의 trajectory 파라미터
+print("\n[Trajectory Parameters]")
+for grp in [1, 2, 3]:
+    coef = models[grp].coef_
+    print(f"\n{labels[grp]}:")
+    print(f"  Intercept: {models[grp].intercept_:.3f}")
+    print(f"  Linear term: {coef[1]:.4f}")
+    print(f"  Quadratic term: {coef[2]:.6f}")
+
+# 나이별 그룹 차이
+print("\n[Age-specific Group Differences]")
+for age in [25, 35, 45]:
+    print(f"\nAge {age}:")
+    idx = np.argmin(np.abs(age_range - age))
+    control_val = trajectories[1][idx]
+    fep_val = trajectories[2][idx]
+    trs_val = trajectories[3][idx]
+    
+    print(f"  Control: {control_val:.2f}")
+    print(f"  FEP: {fep_val:.2f} (diff: {fep_val-control_val:+.2f})")
+    print(f"  TRS: {trs_val:.2f} (diff: {trs_val-control_val:+.2f})")
+
+# Divergence 분석
+print("\n[Divergence Analysis]")
+print(f"Estimated divergence age (threshold={threshold}):")
+if fep_diverge:
+    print(f"  FEP: ~{fep_diverge:.1f} years")
+else:
+    print(f"  FEP: No clear divergence point")
+if trs_diverge:
+    print(f"  TRS: ~{trs_diverge:.1f} years")
+else:
+    print(f"  TRS: No clear divergence point")
+
+# 발달 속도 차이
+print("\n[Developmental Rate]")
+mean_slopes = {grp: np.nanmean(slopes[grp]) for grp in [1, 2, 3]}
+print(f"Mean slope across ages:")
+for grp in [1, 2, 3]:
+    print(f"  {labels[grp]}: {mean_slopes[grp]:.4f}")
+
+print("\n" + "="*60)
